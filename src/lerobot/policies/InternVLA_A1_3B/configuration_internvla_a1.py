@@ -134,6 +134,7 @@ class QwenA1Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False
     train_vlm_only: bool = False
+    train_router_and_act_expert_only: bool = False
 
     scale_factor: int = 8  # param for pixel shuffle / unshuffle
     lambda_gen: float = 0.01

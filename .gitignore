@@ -166,6 +166,7 @@ wandb/
 # Data folders
 data
 outputs
+hf_home
 
 # Translations
 *.mo

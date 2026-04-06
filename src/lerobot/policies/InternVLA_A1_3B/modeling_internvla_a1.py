@@ -126,16 +126,94 @@ def pad_vector(vector, new_dim):
         return vector
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
+from geomloss import SamplesLoss
+def calculate_ot_loss(tokens, router_output, num_sites_to_keep, reg=0.1):
+    """
+    根据图片中的逻辑计算最优传输损失。
+
+    :param tokens: 原始的、未经剪枝的 token 特征 (batch_size, N, d)
+    :param router_output: router 对每个 token 的评分 (batch_size, N, 1)
+    :param num_sites_to_keep: 需要保留的 token 数量 (M)
+    :param reg: Sinkhorn 算法的正则化强度
+    :return: 该层的 OT loss (一个标量)
+    """
+    # 确保 router_output 维度正确 (batch_size, N)
+    router_scores = router_output.squeeze(-1)
+
+    # Step 1: 计算 Router 输出权重 (p)
+    p = torch.softmax(router_scores, dim=1)
+    tokens_normalized = F.normalize(tokens, p=2, dim=-1)
+    # Step 2: 动态生成站点 (sites)
+    # [FIXED] 使用更稳健的 top-k 方法，这比简单的切片更具代表性
+    # 这也更符合 router 的设计初衷 -- 用高分的 token 作为代表
+    with torch.no_grad(): # 站点选择过程不应计算梯度
+        _, topk_indices = torch.topk(router_scores, num_sites_to_keep, dim=1)
+        # 使用 gather 从原始 tokens 中选取站点
+        sites = torch.gather(tokens_normalized, 1, topk_indices.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
+
+    # Step 3, 4, 5: 使用 geomloss 高效计算 OT loss
+    # 'p=2' 对应欧氏距离的平方, blur=reg**0.5 是正则化项
+    loss_fn = SamplesLoss(loss="sinkhorn", p=2, blur=reg**0.5)
+    
+    # [FIX] 为 sites 创建均匀分布的权重 (β)
+    # 获取 batch_size 和 sites 数量
+    batch_size, num_sites, _ = sites.shape 
+    # 创建权重张量，确保 device 和 dtype 匹配，以避免错误
+    beta = torch.full((batch_size, num_sites), 1.0 / num_sites, device=sites.device, dtype=sites.dtype)
+    # geomloss 会自动处理 batch，并假设 sites 为均匀分布
+    # 计算加权样本 (p, tokens) 到均匀样本 sites 之间的 OT 距离
+    ot_loss = loss_fn(p, tokens_normalized, beta, sites)
+
+    return ot_loss
 
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
-    layer_idx, inputs_embeds, attention_mask, position_ids, und_expert, gen_expert, act_expert
+    layer_idx, inputs_embeds, attention_mask, position_ids, und_expert, gen_expert, act_expert, prefix_router, keep_ratio=0.5
 ):
     models = [und_expert.language_model, gen_expert, act_expert]
     query_states = []
     key_states = []
     value_states = []
-    for i, hidden_states in enumerate(inputs_embeds):
+    layer_ot_loss = 0.0 # 初始化本层的 OT Loss 为 0
+     # ---- 新的临时剪枝与恢复逻辑 ----
+    # 假设剪枝只作用于第一个输入 (und_expert)
+    # print("llllllllllllllllllllllllllllaaaaaaaaaaaaaa")
+    original_prefix_hidden_states = inputs_embeds[0]
+    batch_size, original_sequence_length, hidden_dim = original_prefix_hidden_states.shape
+
+    # 1. 计算 router 分数并获取 Top-K token
+    router_output = prefix_router(original_prefix_hidden_states)
+
+    num_tokens_to_keep = int(original_sequence_length * keep_ratio)
+    # 可以在这里计算 OT Loss (如果需要的话), 沿用你之前的逻辑
+    layer_ot_loss = calculate_ot_loss(
+        original_prefix_hidden_states, 
+        router_output, 
+        num_tokens_to_keep  ### <--- 使用新计算出的值
+    )
+
+    scores, indices_to_keep = torch.topk(router_output.squeeze(-1), num_tokens_to_keep, dim=1)
+    indices_to_keep, _ = torch.sort(indices_to_keep, dim=1)
+
+    # 2. 创建一个稀疏的 hidden_states 用于计算
+    # 创建一个全零的 "画布"
+    pruned_hidden_states = torch.zeros_like(original_prefix_hidden_states)
+    
+    # 将被选中的 token "散布" (scatter) 到画布的相应位置
+    # indices_for_gather 的形状需要是 (batch_size, num_tokens_to_keep, hidden_dim)
+    indices_for_gather = indices_to_keep.unsqueeze(-1).expand(batch_size, -1, hidden_dim)
+    
+    # 先用 gather 选出重要的 token
+    selected_tokens = torch.gather(original_prefix_hidden_states, 1, indices_for_gather)
+    
+    # 再用 scatter_ 将这些 token 放回稀疏画布的正确位置
+    pruned_hidden_states.scatter_(1, indices_for_gather, selected_tokens)
+    
+    # 创建处理后的 inputs_embeds 列表
+    # 只有 prefix (第一个输入) 被剪枝了
+    processed_inputs_embeds = [pruned_hidden_states] + inputs_embeds[1:]
+
+    for i, hidden_states in enumerate(processed_inputs_embeds):
         layer = models[i].layers[layer_idx]
         hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
         input_shape = hidden_states.shape[:-1]
@@ -181,14 +259,15 @@ def compute_layer_complete(
     # Process layer outputs
     outputs_embeds = []
     start_pos = 0
-    for i, hidden_states in enumerate(inputs_embeds):
+    for i, original_input in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        end_pos = start_pos + hidden_states.shape[1]
+        end_pos = start_pos + original_input.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
-        out_emb = out_emb + hidden_states
+        out_emb = out_emb + original_input
+
         after_first_residual = out_emb.clone()
         out_emb = layer.post_attention_layernorm(out_emb)
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
@@ -199,7 +278,8 @@ def compute_layer_complete(
         out_emb = out_emb + after_first_residual
         outputs_embeds.append(out_emb)
         start_pos = end_pos
-    return outputs_embeds
+
+    return outputs_embeds, layer_ot_loss
 
 
 class QwenConfig:  
@@ -310,6 +390,10 @@ class Qwen3VLWithExpertModel(
 
         self.to_bfloat16_for_selected_params(precision)
 
+        # new add
+        input_dim = vlm_config.hidden_size
+        self.prefix_router = nn.Linear(input_dim, 1, dtype=torch.bfloat16) 
+
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
@@ -389,11 +473,12 @@ class Qwen3VLWithExpertModel(
                 and self.act_expert.gradient_checkpointing
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
+            # new add
+            ot_loss = 0.0
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
-                    inputs_embeds = torch.utils.checkpoint.checkpoint(
+                    inputs_embeds, layer_ot_loss = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
                         layer_idx,
                         inputs_embeds,
@@ -404,9 +489,11 @@ class Qwen3VLWithExpertModel(
                         und_expert=self.und_expert,
                         gen_expert=self.gen_expert, 
                         act_expert=self.act_expert,
+                        # new add
+                        prefix_router=self.prefix_router,
                     )
                 else:
-                    inputs_embeds = compute_layer_complete(
+                    inputs_embeds, layer_ot_loss = compute_layer_complete(
                         layer_idx,
                         inputs_embeds,
                         attention_mask,
@@ -414,7 +501,10 @@ class Qwen3VLWithExpertModel(
                         und_expert=self.und_expert,
                         gen_expert=self.gen_expert, 
                         act_expert=self.act_expert,
+                        # new add
+                        prefix_router=self.prefix_router,
                     )
+                ot_loss += layer_ot_loss
 
             # final norm
             def compute_final_norms(inputs_embeds):
@@ -440,7 +530,7 @@ class Qwen3VLWithExpertModel(
             middle_output = outputs_embeds[1]
             suffix_output = outputs_embeds[2]
 
-        return [prefix_output, middle_output, suffix_output], past_key_values
+        return [prefix_output, middle_output, suffix_output], past_key_values, ot_loss
 
 
 class QwenA1(nn.Module):
@@ -520,7 +610,27 @@ class QwenA1(nn.Module):
             self.qwen3_vl_with_expert.act_expert.eval()
             for params in self.qwen3_vl_with_expert.act_expert.parameters():
                 params.requires_grad = False
-        
+                
+        # new add
+        if self.config.train_router_and_act_expert_only:
+            print("Freezing all parameters and unfreezing only the router and action expert.")
+            
+            # 步骤 1: 冻结模型所有参数
+            # 假设 qwen3_vl_with_expert 是包含所有相关模块的顶层 nn.Module
+            for param in self.qwen3_vl_with_expert.parameters():
+                param.requires_grad = False
+                
+            # 步骤 2: 解冻 action expert (act_expert)
+            print("Unfreezing act_expert parameters...")
+            for param in self.qwen3_vl_with_expert.act_expert.parameters():
+                param.requires_grad = True
+                
+            # 步骤 3: 解冻 prefix_router
+            print("Unfreezing prefix_router parameters...")
+            for param in self.qwen3_vl_with_expert.prefix_router.parameters():
+                param.requires_grad = True
+
+
         self.cosmos.eval()
         for params in self.cosmos.parameters():
             params.requires_grad = False
@@ -533,7 +643,13 @@ class QwenA1(nn.Module):
 
         if self.config.train_expert_only:
             self.qwen3_vl_with_expert.und_expert.eval()
-        
+
+        # new add
+        if self.config.train_router_and_act_expert_only:
+            # 我们不训练 und_expert 和 gen_expert，所以手动将它们设置为 eval 模式。
+            self.qwen3_vl_with_expert.und_expert.eval()
+            self.qwen3_vl_with_expert.gen_expert.eval()
+
         self.cosmos.eval()
         return self
     
@@ -771,17 +887,19 @@ class QwenA1(nn.Module):
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
+        # add ot_loss below
         def forward_func(prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids):
-            (_, middle_out, suffix_out), _ = self.qwen3_vl_with_expert.forward(
+            (_, middle_out, suffix_out), _ , ot_loss = self.qwen3_vl_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, middle_embs, suffix_embs],
                 use_cache=False,
             )
-            return middle_out, suffix_out
+            return middle_out, suffix_out, ot_loss
 
-        middle_out, suffix_out = self._apply_checkpoint(
+        # add ot_loss below
+        middle_out, suffix_out, ot_loss = self._apply_checkpoint(
             forward_func, prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids
         )
 
@@ -803,11 +921,11 @@ class QwenA1(nn.Module):
 
         loss_action = F.mse_loss(u_t, v_t, reduction="none")
 
-        return loss_action, loss_gen
+        return loss_action, loss_gen, ot_loss
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
-        self, images, img_masks, pixel_values, image_grid_thw, lang_tokens, lang_masks, state, noise=None, num_steps=None, decode_image=False
+        self, images, img_masks, pixel_values, image_grid_thw, lang_tokens, lang_masks, state, noise=None, num_steps=None, decode_image=False, keep_ratio=1.0 # new add
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
@@ -829,9 +947,37 @@ class QwenA1(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             pixel_values, image_grid_thw, lang_tokens, lang_masks
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, prefix_pad_masks)
+        
+        if keep_ratio < 1.0 and hasattr(self, 'prefix_router'):
+            original_prefix_hidden_states = prefix_embs
+            batch_size, original_sequence_length, hidden_dim = original_prefix_hidden_states.shape
 
+            # A. 使用你的 prefix_router 计算每个 token 的重要性分数
+            # 我们假设 self.prefix_router 是你已经实例化的打分模型
+            router_output = self.qwen3_vl_with_expert.prefix_router(original_prefix_hidden_states) # shape: (batch_size, seq_len, 1)
+
+            # B. 根据 keep_ratio 计算需要保留的 token 数量，并选出 Top-K
+            num_tokens_to_keep = int(original_sequence_length * keep_ratio)
+            # topk 在最后一个维度上操作， squeeze(-1) 将 (B, S, 1) -> (B, S)
+            _, indices_to_keep = torch.topk(router_output.squeeze(-1), num_tokens_to_keep, dim=1)
+            
+            # C. 对索引排序，以保持 token 原始的相对顺序，这对于位置编码非常重要
+            indices_to_keep, _ = torch.sort(indices_to_keep, dim=1)
+
+            # D. 执行“手术”：根据筛选出的索引，裁剪所有与序列长度相关的张量
+            # 创建批次索引，用于高级索引，可以同时为批次中的每个样本选择不同的索引
+            batch_indices = torch.arange(batch_size, device=device)[:, None]
+            
+            prefix_embs = prefix_embs[batch_indices, indices_to_keep]
+            prefix_pad_masks = prefix_pad_masks[batch_indices, indices_to_keep]
+            prefix_att_masks = prefix_att_masks[batch_indices, indices_to_keep]
+            prefix_position_ids = prefix_position_ids[batch_indices, indices_to_keep]
+            # 注意：如果 rope_deltas 也和序列长度有关，同样需要裁剪
+            # if rope_deltas is not None and rope_deltas.shape[1] == original_sequence_length:
+            #     rope_deltas = rope_deltas[batch_indices, indices_to_keep]
+        
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.qwen3_vl_with_expert.und_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
@@ -1099,21 +1245,24 @@ class QwenA1Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss
-        losses_action, loss_gen = self.model.forward(images, img_masks, pixel_values, image_grid_thw, lang_tokens, lang_masks, state, actions)
+        losses_action, loss_gen, ot_loss = self.model.forward(images, img_masks, pixel_values, image_grid_thw, lang_tokens, lang_masks, state, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses_action = losses_action[:, :, :original_action_dim]
         loss_action = losses_action.mean()
-
-        loss = loss_action + self.config.lambda_gen * loss_gen
+        ot_loss = ot_loss.mean()
+        loss = loss_action + self.config.lambda_gen * loss_gen + self.config.lambda_gen * ot_loss
 
         loss_dict = {
             "loss": loss.item(),
             "loss_action": loss_action.item(), 
             "loss_gen": loss_gen.item(), 
+            "ot_loss": ot_loss.item(), # new add
         }
-        
+
+        print(loss_dict)
+
         losses_action = losses_action.mean(dim=[0, 1]).detach().cpu().numpy().tolist()
         loss_dict.update({
             f"loss_action_dim{i}": losses_action[i] for i in range(original_action_dim)

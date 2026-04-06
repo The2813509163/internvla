@@ -5,15 +5,16 @@ set -euo pipefail
 ################################# ENV config ##################################
 
 export HF_HOME=${HF_HOME}
-
-WANDB_TOKEN=${WANDB_TOKEN}
+# export WANDB_TOKEN=${WANDB_TOKEN}
+export CUDA_VISIBLE_DEVICES=1,2
+# WANDB_TOKEN=${WANDB_TOKEN}
 CONDA_ROOT=${_CONDA_ROOT}
 CONDA_ENV=internvla_a1
 
 source ${CONDA_ROOT}/etc/profile.d/conda.sh
 conda activate ${CONDA_ENV}
 
-wandb login ${WANDB_TOKEN}
+# wandb login ${WANDB_TOKEN}
 
 ###############################################################################
 
@@ -33,15 +34,18 @@ NUM_PROCESSES=$((NODE_COUNT * PROC_PER_NODE))
 # export NCCL_ASYNC_ERROR_HANDLING=1
 # export TORCH_NCCL_BLOCKING_WAIT=1
 export CUDA_HOME="/usr/local/cuda-12.8"
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+# export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+#  如果LD_LIBRARY_PATH已设置，则在其前面加上冒号，否则不加
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 export WANDB_MODE=offline
-export HF_HUB_OFFLINE=1
+export HF_HUB_OFFLINE=0
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
@@ -60,7 +64,8 @@ cd ${PROJ_ROOT}
 
 # 1. policy config
 POLICY="qwena1"
-PRETRAINED_PATH="InternRobotics/InternVLA-A1-3B"
+# PRETRAINED_PATH="/data/kris/qianxuzhen/InternVLA-A1/hf_home/models/InternVLA-A1-3B"
+PRETRAINED_PATH="InternRobotics/InternVLA-A1-3B-RoboTwin"
 
 # 2. dataset config
 DATASET_REPO_ID="$(
@@ -102,12 +107,13 @@ ARGS=(
     --policy.gradient_checkpointing=false
     --policy.dtype=bfloat16
     --policy.optimizer_lr=5.0e-5
-    --policy.scheduler_warmup_steps=2000
-    --policy.scheduler_decay_steps=200000
+    --policy.scheduler_warmup_steps=500
+    --policy.scheduler_decay_steps=10000
     --policy.scheduler_decay_lr=5.0e-6
     --policy.freeze_vision_encoder=false
     --policy.train_expert_only=false
     --policy.train_vlm_only=false
+    --policy.train_router_and_act_expert_only=true
     --policy.qwen3_vl_variant=qwen3_vl_28l
     --policy.action_expert_variant=qwen3_28l
 
@@ -124,13 +130,13 @@ ARGS=(
     # ---- Training ----
     --seed=42
     --batch_size=8
-    --steps=200000
+    --steps=10000
     # --eval_freq=60000
-    --save_freq=20000
+    --save_freq=5000
     --log_freq=200
 
     # ---- Logging ----
-    --wandb.enable=true
+    --wandb.enable=false
     --wandb.project=lerobot_lab_${POLICY}
     --wandb.mode=offline
 )

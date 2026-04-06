@@ -7,7 +7,7 @@ export HF_HOME=${HF_HOME}
 
 WANDB_TOKEN=${WANDB_TOKEN}
 CONDA_ROOT=${_CONDA_ROOT}
-CONDA_ENV=internvla_a1
+CONDA_ENV=internvla_a1_eval
 #CONDA_ENV=lerobot_lab
 source ${CONDA_ROOT}/etc/profile.d/conda.sh
 conda activate ${CONDA_ENV}
@@ -52,6 +52,7 @@ PRETRAINED_CKPT=InternRobotics/InternVLA-A1-3B-RoboTwin
 BASE_OUTPUT_PATH=${PROJ_ROOT}/evaluation/RoboTwin/output
 TASK_CONFIG=demo_clean
 TASK_IDX=0 # adjust_bottle
+TEST_NUM=10
 
 OUTPUT_PATH=${BASE_OUTPUT_PATH}/${TASK_CONFIG}/${TASK_IDX}
 
@@ -60,4 +61,5 @@ python ../../evaluation/RoboTwin/inference.py \
     --args.ckpt_path $PRETRAINED_CKPT \
     --args.video_dir $OUTPUT_PATH \
     --args.task_config $TASK_CONFIG \
-    --args.task_idx $TASK_IDX
+    --args.task_idx $TASK_IDX \
+    --args.test_num $TEST_NUM
